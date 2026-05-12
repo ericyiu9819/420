@@ -1,17 +1,19 @@
 #!/bin/bash
 # ============================================================
-# 03-wg-tls.sh  —— WireGuard TLS 伪装 + 443 端口脚本（最终优化版 v2.0）
-# 运行顺序：必须在 01-optimize + 02-install 之后执行
-# 新增：PersistentKeepalive 强烈推荐设置
+# 03-wg-tls.sh  —— WireGuard TLS 伪装 + 443 端口脚本（最终优化版 v2.1 - 修复 unbound variable）
 # ============================================================
 
-set -euo pipefail
+set -eo pipefail   # 移除 -u 避免 read 失败时 unbound variable 错误
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
+
+DOMAIN=""
+EMAIL=""
+
 
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}   WireGuard TLS 伪装 + 443 端口（最终优化版）${NC}"
