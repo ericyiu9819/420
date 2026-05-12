@@ -1,7 +1,8 @@
 #!/bin/bash
 # ============================================================
-# 03-wg-tls.sh  —— WireGuard TLS 伪装 + 443 端口脚本（最终版）
+# 03-wg-tls.sh  —— WireGuard TLS 伪装 + 443 端口脚本（最终优化版 v2.0）
 # 运行顺序：必须在 01-optimize + 02-install 之后执行
+# 新增：PersistentKeepalive 强烈推荐设置
 # ============================================================
 
 set -euo pipefail
@@ -13,8 +14,11 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}   WireGuard TLS 伪装 + 443 端口（最终版）${NC}"
+echo -e "${BLUE}   WireGuard TLS 伪装 + 443 端口（最终优化版）${NC}"
 echo -e "${BLUE}========================================${NC}"
+
+echo -e "${YELLOW}此脚本将帮助你实现：\n  • TLS 伪装（浏览器看到普通网站\uff09\n  • 443 端口（隐蔽性最强\uff09\n  • 强烈推荐：客户端 PersistentKeepalive = 25${NC}"
+echo ""
 
 if [ "$(id -u)" -ne 0 ]; then
     echo -e "${RED}错误：请使用 sudo 运行此脚本${NC}"
@@ -126,8 +130,21 @@ echo -e "浏览器测试    : ${BLUE}https://$DOMAIN${NC}"
 echo -e "客户端配置    : 把 Endpoint 改为 ${BLUE}$DOMAIN:443${NC}"
 echo -e "推荐 MTU      : 1380 ~ 1420"
 echo ""
+# ==================== PersistentKeepalive 强烈推荐 ====================
+echo -e "${YELLOW}【强烈推荐：客户端 PersistentKeepalive 设置】${NC}"
+echo "这是解决手机、弱网、NAT 环境断流的最重要参数！"
+echo ""
+echo -e "在客户端配置文件中找到 [Peer] 部分，添加下面这一行："
+echo -e "${GREEN}PersistentKeepalive = 25${NC}"
+echo ""
+echo -e "推荐值："
+echo "  • 手机用户：25（最常用）"
+echo "  • 电脑用户：15~25"
+echo "  • 极差网络：10"
+echo ""
 echo -e "${YELLOW}重要提示：${NC}"
 echo "1. 客户端连接后可通过 https://$DOMAIN 验证伪装是否生效"
-echo "2. 如需恢复原端口，编辑 /etc/wireguard/wg0.conf 把 443 改回原端口"
+echo "2. 如需恢复原端口，编辑 /etc/wireguard/wg0.conf 把 443 改回原值"
 echo "3. 证书自动续期已由 certbot 配置"
+echo "4. 添加 PersistentKeepalive = 25 后，重启客户端即可生效"
 echo -e "${GREEN}========================================${NC}"
