@@ -11,9 +11,24 @@ UPLINK_MBIT=""
 RTT_MS="80"
 EGRESS_HEADROOM_PCT="96"
 CC_MODE="auto"
+QDISC_MODE="auto"
 MODE="apply"
 DRY_RUN="0"
 SYSCTL_PERSIST_FILE=""
+ACTIVE_CC=""
+CURRENT_QDISC=""
+CURRENT_ECN="0"
+CURRENT_FASTOPEN="0"
+CURRENT_MTU_PROBING="0"
+CURRENT_RMEM_MAX="0"
+CURRENT_WMEM_MAX="0"
+CURRENT_SOMAXCONN="0"
+CURRENT_SYN_BACKLOG="0"
+TARGET_ECN="1"
+TARGET_FASTOPEN="3"
+TARGET_MTU_PROBING="1"
+TARGET_SOMAXCONN="4096"
+TARGET_SYN_BACKLOG="8192"
 
 usage() {
   cat <<EOF
@@ -32,7 +47,8 @@ Options:
   --iface NAME              Network interface, default: system default route iface
   --rtt-ms N                Baseline RTT used for BDP sizing, default: 80
   --egress-headroom-pct N   Shape egress to N%% of real rate, default: 96
-  --cc auto|bbr|cubic       Congestion control choice, default: auto
+  --cc auto|bbrplus|bbr|cubic  Congestion control choice, default: auto
+  --qdisc auto|cake|htb|keep   Queue discipline strategy, default: auto
   --persist-sysctl PATH     Write persistent sysctl file to PATH
   --dry-run                 Print actions without applying them
   --help                    Show this message
@@ -84,6 +100,8 @@ parse_args() {
         EGRESS_HEADROOM_PCT="${2:-}"; shift 2 ;;
       --cc)
         CC_MODE="${2:-}"; shift 2 ;;
+      --qdisc)
+        QDISC_MODE="${2:-}"; shift 2 ;;
       --mode)
         MODE="${2:-}"; shift 2 ;;
       --persist-sysctl)
@@ -115,13 +133,39 @@ validate_numbers() {
   (( EGRESS_HEADROOM_PCT >= 80 && EGRESS_HEADROOM_PCT <= 100 )) || die "--egress-headroom-pct should be 80-100"
 }
 
+max_int() {
+  local a="$1"
+  local b="$2"
+  if (( a > b )); then
+    printf '%s' "${a}"
+  else
+    printf '%s' "${b}"
+  fi
+}
+
+detect_current_state() {
+  ACTIVE_CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  CURRENT_QDISC="$(tc qdisc show dev "${IFACE}" 2>/dev/null | awk 'NR==1 {print $2}')"
+  CURRENT_ECN="$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo 0)"
+  CURRENT_FASTOPEN="$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 0)"
+  CURRENT_MTU_PROBING="$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo 0)"
+  CURRENT_RMEM_MAX="$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)"
+  CURRENT_WMEM_MAX="$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)"
+  CURRENT_SOMAXCONN="$(sysctl -n net.core.somaxconn 2>/dev/null || echo 0)"
+  CURRENT_SYN_BACKLOG="$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo 0)"
+}
+
 select_cc() {
   local available
   available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
 
   case "${CC_MODE}" in
     auto)
-      if grep -qw bbr <<<"${available}"; then
+      if [[ -n "${ACTIVE_CC}" ]] && grep -qw "${ACTIVE_CC}" <<<"${available}" && [[ "${ACTIVE_CC}" =~ ^(bbrplus|bbr|cubic)$ ]]; then
+        CC_MODE="${ACTIVE_CC}"
+      elif grep -qw bbrplus <<<"${available}"; then
+        CC_MODE="bbrplus"
+      elif grep -qw bbr <<<"${available}"; then
         CC_MODE="bbr"
       elif grep -qw cubic <<<"${available}"; then
         CC_MODE="cubic"
@@ -130,11 +174,30 @@ select_cc() {
       fi
       [[ -n "${CC_MODE}" ]] || die "unable to determine an available congestion control"
       ;;
-    bbr|cubic)
+    bbrplus|bbr|cubic)
       grep -qw "${CC_MODE}" <<<"${available}" || die "congestion control ${CC_MODE} not available: ${available}"
       ;;
     *)
-      die "--cc must be auto, bbr, or cubic"
+      die "--cc must be auto, bbrplus, bbr, or cubic"
+      ;;
+  esac
+}
+
+select_qdisc_mode() {
+  case "${QDISC_MODE}" in
+    auto)
+      if [[ "${CURRENT_QDISC}" == "cake" ]]; then
+        QDISC_MODE="cake"
+      elif [[ -n "${CURRENT_QDISC}" ]]; then
+        QDISC_MODE="htb"
+      else
+        QDISC_MODE="htb"
+      fi
+      ;;
+    cake|htb|keep)
+      ;;
+    *)
+      die "--qdisc must be auto, cake, htb, or keep"
       ;;
   esac
 }
@@ -163,11 +226,25 @@ calc_values() {
   QUEUE_LIMIT_PACKETS=$(( BDP_BYTES / 1500 ))
   [[ ${QUEUE_LIMIT_PACKETS} -lt 128 ]] && QUEUE_LIMIT_PACKETS=128
   [[ ${QUEUE_LIMIT_PACKETS} -gt 4096 ]] && QUEUE_LIMIT_PACKETS=4096
+
+  SOCK_BUF_MAX="$(max_int "${SOCK_BUF_MAX}" "${CURRENT_RMEM_MAX}")"
+  SOCK_BUF_MAX="$(max_int "${SOCK_BUF_MAX}" "${CURRENT_WMEM_MAX}")"
+  TARGET_SOMAXCONN="$(max_int 4096 "${CURRENT_SOMAXCONN}")"
+  TARGET_SYN_BACKLOG="$(max_int 8192 "${CURRENT_SYN_BACKLOG}")"
+
+  if (( CURRENT_ECN > 0 )); then
+    TARGET_ECN="${CURRENT_ECN}"
+  fi
+  TARGET_FASTOPEN="$(max_int 3 "${CURRENT_FASTOPEN}")"
+  TARGET_MTU_PROBING="$(max_int 1 "${CURRENT_MTU_PROBING}")"
 }
 
 print_summary() {
   cat <<EOF
 Interface:              ${IFACE}
+Detected qdisc:         ${CURRENT_QDISC:-none}
+Apply qdisc mode:       ${QDISC_MODE}
+Active CC:              ${ACTIVE_CC:-unknown}
 Congestion control:     ${CC_MODE}
 Real uplink:            ${UPLINK_MBIT} Mbit/s
 Shaped uplink:          $(( SHAPED_RATE_KBIT / 1000 )) Mbit/s (${EGRESS_HEADROOM_PCT}%)
@@ -177,6 +254,8 @@ Socket buffer default:  ${SOCK_BUF_DEFAULT} bytes
 Socket buffer max:      ${SOCK_BUF_MAX} bytes
 Queue packet limit:     ${QUEUE_LIMIT_PACKETS}
 Burst bytes:            ${TBF_BURST_BYTES}
+Target somaxconn:       ${TARGET_SOMAXCONN}
+Target syn backlog:     ${TARGET_SYN_BACKLOG}
 EOF
 }
 
@@ -206,16 +285,16 @@ backup_state() {
 apply_sysctls() {
   sysctl_set net.core.default_qdisc "fq"
   sysctl_set net.ipv4.tcp_congestion_control "${CC_MODE}"
-  sysctl_set net.ipv4.tcp_ecn "1"
-  sysctl_set net.ipv4.tcp_fastopen "3"
-  sysctl_set net.ipv4.tcp_mtu_probing "1"
+  sysctl_set net.ipv4.tcp_ecn "${TARGET_ECN}"
+  sysctl_set net.ipv4.tcp_fastopen "${TARGET_FASTOPEN}"
+  sysctl_set net.ipv4.tcp_mtu_probing "${TARGET_MTU_PROBING}"
   sysctl_set net.core.rmem_max "${SOCK_BUF_MAX}"
   sysctl_set net.core.wmem_max "${SOCK_BUF_MAX}"
   sysctl_set net.ipv4.tcp_rmem "4096 ${SOCK_BUF_DEFAULT} ${SOCK_BUF_MAX}"
   sysctl_set net.ipv4.tcp_wmem "4096 ${SOCK_BUF_DEFAULT} ${SOCK_BUF_MAX}"
   sysctl_set net.ipv4.tcp_notsent_lowat "16384"
-  sysctl_set net.core.somaxconn "4096"
-  sysctl_set net.ipv4.tcp_max_syn_backlog "8192"
+  sysctl_set net.core.somaxconn "${TARGET_SOMAXCONN}"
+  sysctl_set net.ipv4.tcp_max_syn_backlog "${TARGET_SYN_BACKLOG}"
 
   if [[ -n "${SYSCTL_PERSIST_FILE}" ]]; then
     log "writing persistent sysctl file: ${SYSCTL_PERSIST_FILE}"
@@ -226,16 +305,16 @@ apply_sysctls() {
       cat >"${SYSCTL_PERSIST_FILE}" <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=${CC_MODE}
-net.ipv4.tcp_ecn=1
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_ecn=${TARGET_ECN}
+net.ipv4.tcp_fastopen=${TARGET_FASTOPEN}
+net.ipv4.tcp_mtu_probing=${TARGET_MTU_PROBING}
 net.core.rmem_max=${SOCK_BUF_MAX}
 net.core.wmem_max=${SOCK_BUF_MAX}
 net.ipv4.tcp_rmem=4096 ${SOCK_BUF_DEFAULT} ${SOCK_BUF_MAX}
 net.ipv4.tcp_wmem=4096 ${SOCK_BUF_DEFAULT} ${SOCK_BUF_MAX}
 net.ipv4.tcp_notsent_lowat=16384
-net.core.somaxconn=4096
-net.ipv4.tcp_max_syn_backlog=8192
+net.core.somaxconn=${TARGET_SOMAXCONN}
+net.ipv4.tcp_max_syn_backlog=${TARGET_SYN_BACKLOG}
 EOF
     fi
   fi
@@ -244,9 +323,19 @@ EOF
 apply_qdisc() {
   # Principle: shape slightly below the true egress rate so the bottleneck queue
   # sits on this VPS, where fq pacing can keep it shallow and stable.
-  run "tc qdisc replace dev '${IFACE}' root handle 1: htb default 10"
-  run "tc class replace dev '${IFACE}' parent 1: classid 1:10 htb rate ${SHAPED_RATE_KBIT}kbit ceil ${SHAPED_RATE_KBIT}kbit burst ${TBF_BURST_BYTES}"
-  run "tc qdisc replace dev '${IFACE}' parent 1:10 handle 10: fq limit ${QUEUE_LIMIT_PACKETS} pacing"
+  case "${QDISC_MODE}" in
+    keep)
+      log "keeping existing qdisc on ${IFACE}"
+      ;;
+    cake)
+      run "tc qdisc replace dev '${IFACE}' root cake bandwidth ${SHAPED_RATE_KBIT}kbit diffserv3 triple-isolate nonat nowash no-ack-filter split-gso rtt ${RTT_MS}ms raw overhead 0"
+      ;;
+    htb)
+      run "tc qdisc replace dev '${IFACE}' root handle 1: htb default 10"
+      run "tc class replace dev '${IFACE}' parent 1: classid 1:10 htb rate ${SHAPED_RATE_KBIT}kbit ceil ${SHAPED_RATE_KBIT}kbit burst ${TBF_BURST_BYTES}"
+      run "tc qdisc replace dev '${IFACE}' parent 1:10 handle 10: fq limit ${QUEUE_LIMIT_PACKETS} pacing"
+      ;;
+  esac
 }
 
 status() {
@@ -290,8 +379,11 @@ restore() {
   sysctl_set net.core.somaxconn "${saved[10]}"
   sysctl_set net.ipv4.tcp_max_syn_backlog "${saved[11]}"
 
+  # tc qdisc show output is not a reversible config source, so restore removes
+  # the accelerator root qdisc and relies on your own persisted network config,
+  # service scripts, or reboot to reconstruct any previous custom tree exactly.
   run "tc qdisc del dev '${IFACE}' root || true"
-  log "restore finished"
+  log "restore finished (sysctl restored; qdisc restore is best-effort)"
 }
 
 main() {
@@ -304,7 +396,9 @@ main() {
   if [[ "${MODE}" != "restore" ]]; then
     detect_iface
     validate_numbers
+    detect_current_state
     select_cc
+    select_qdisc_mode
     calc_values
   else
     detect_iface
