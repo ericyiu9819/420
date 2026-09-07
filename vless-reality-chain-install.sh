@@ -24,9 +24,9 @@ ENTRY_UUID=""
 ENTRY_PRIVATE_KEY=""
 ENTRY_PUBLIC_KEY=""
 ENTRY_SHORT_ID=""
-TCP_TUNE="0"
+NET_TUNE="1"
 UPLINK_MBIT=""
-RTT_MS="80"
+RTT_MS=""
 NONINTERACTIVE="0"
 
 usage() {
@@ -41,10 +41,11 @@ Usage:
   2. 在入口 VPS 上：$(basename "$0") --mode entry --cred-file /path/to/exit-credentials.env
 
 Modes:
-  exit    安装出口节点（仅允许 Entry IP 访问 443）
-  entry   安装入口节点（转发到 Exit，并输出客户端链接）
-  status  查看 xray 服务与已保存凭据
-  client  根据已保存凭据重新输出客户端链接
+  exit      安装出口节点（仅允许 Entry IP 访问 443）
+  entry     安装入口节点（转发到 Exit，并输出客户端链接）
+  net-tune  单独应用/刷新网络栈优化（BDP + 出口整形 + 代理并发）
+  status    查看 xray 服务、网络栈与已保存凭据
+  client    根据已保存凭据重新输出客户端链接
 
 Exit options:
   --entry-ip IP              入口 VPS 公网 IP（用于防火墙白名单）
@@ -62,11 +63,16 @@ Entry options:
   --reality-sni NAME         Entry 侧 SNI，默认 ${ENTRY_REALITY_SNI}
 
 Common options:
-  --tcp-tune                 安装后调用 vps-tcp-accelerator.sh
-  --uplink-mbit N            TCP 调优上行带宽（Mbit/s）
-  --rtt-ms N                 TCP 调优基线 RTT，默认 80
+  --no-net-tune              跳过网络栈优化（默认安装时自动开启）
+  --uplink-mbit N            真实上行带宽（Mbit/s），未指定则自动探测
+  --rtt-ms N                 基线 RTT（ms），未指定则 ping 对端自动测
   --noninteractive           非交互模式（需补全必填参数）
   -h, --help                 显示帮助
+
+网络栈优化（默认开启，从 B/T/R 基本量推导）：
+  - BDP 自适应 socket 缓冲
+  - 出口 HTB+fq 整形（瓶颈在本机）
+  - 角色化并发参数 + Xray 文件句柄
 
 示例：
   sudo bash $(basename "$0") --mode exit --entry-ip 1.2.3.4
@@ -108,7 +114,7 @@ parse_args() {
         fi
         shift 2
         ;;
-      --tcp-tune) TCP_TUNE="1"; shift ;;
+      --no-net-tune) NET_TUNE="0"; shift ;;
       --uplink-mbit) UPLINK_MBIT="$2"; shift 2 ;;
       --rtt-ms) RTT_MS="$2"; shift 2 ;;
       --noninteractive) NONINTERACTIVE="1"; shift ;;
@@ -393,14 +399,45 @@ setup_firewall_entry() {
   fi
 }
 
-maybe_tcp_tune() {
-  local tune_script="${SCRIPT_DIR}/vps-tcp-accelerator.sh"
-  [[ "$TCP_TUNE" == "1" ]] || return 0
-  [[ -f "$tune_script" ]] || { log "未找到 ${tune_script}，跳过 TCP 调优"; return 0; }
-  prompt_if_empty UPLINK_MBIT "请输入真实上行带宽(Mbit/s)"
-  log "应用 TCP 调优 uplink=${UPLINK_MBIT} rtt=${RTT_MS} ..."
-  bash "$tune_script" --uplink-mbit "$UPLINK_MBIT" --rtt-ms "$RTT_MS" \
-    --persist-sysctl /etc/sysctl.d/99-vless-chain-tcp.conf
+apply_net_stack() {
+  local role="$1"
+  local stack_script="${SCRIPT_DIR}/vless-chain-net-stack.sh"
+  [[ "$NET_TUNE" == "1" ]] || { log "已跳过网络栈优化（--no-net-tune）"; return 0; }
+  [[ -f "$stack_script" ]] || { log "未找到 ${stack_script}，跳过网络栈优化"; return 0; }
+
+  local args=(--role "$role" --mode apply)
+  [[ -n "$UPLINK_MBIT" ]] && args+=(--uplink-mbit "$UPLINK_MBIT")
+  [[ -n "$RTT_MS" ]] && args+=(--rtt-ms "$RTT_MS")
+  [[ "$NONINTERACTIVE" == "1" ]] && args+=(--noninteractive)
+
+  if [[ "$role" == "entry" && -n "$EXIT_IP" ]]; then
+    args+=(--peer-ip "$EXIT_IP")
+  elif [[ "$role" == "exit" && -n "$ENTRY_IP" ]]; then
+    args+=(--peer-ip "$ENTRY_IP")
+  fi
+
+  log "从基本量推导并应用网络栈（role=${role}）..."
+  bash "$stack_script" "${args[@]}"
+}
+
+run_net_stack_only() {
+  local role=""
+  if [[ -f "$CRED_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CRED_FILE"
+    role="${NODE_ROLE:-}"
+    [[ "$role" == "entry" && -n "${EXIT_IP:-}" ]] && EXIT_IP="$EXIT_IP"
+    [[ "$role" == "exit" && -n "${ENTRY_IP:-}" ]] && ENTRY_IP="$ENTRY_IP"
+  fi
+  if [[ -z "$role" ]]; then
+    if [[ "$NONINTERACTIVE" == "1" ]]; then
+      die "net-tune 需要已知节点角色，请先安装或指定 --cred-file"
+    fi
+    read -r -p "节点角色 (entry/exit): " role
+  fi
+  [[ "$role" == "entry" || "$role" == "exit" ]] || die "role 必须是 entry 或 exit"
+  NET_TUNE="1"
+  apply_net_stack "$role"
 }
 
 restart_xray() {
@@ -502,7 +539,7 @@ install_exit() {
 
   write_exit_config
   setup_firewall_exit
-  maybe_tcp_tune
+  apply_net_stack exit
   restart_xray
   save_exit_credentials
 
@@ -542,7 +579,7 @@ install_entry() {
 
   write_entry_config
   setup_firewall_entry
-  maybe_tcp_tune
+  apply_net_stack entry
   restart_xray
   save_entry_credentials
   show_client_link
@@ -563,8 +600,19 @@ show_status() {
   if [[ -f "$CRED_FILE" ]]; then
     echo "--- ${CRED_FILE} ---"
     grep -v 'PRIVATE_KEY' "$CRED_FILE" || true
+    # shellcheck disable=SC1090
+    source "$CRED_FILE"
   else
     echo "未找到凭据文件: ${CRED_FILE}"
+  fi
+  local stack_script="${SCRIPT_DIR}/vless-chain-net-stack.sh"
+  local node_role="${NODE_ROLE:-}"
+  if [[ -f "$stack_script" && -n "$node_role" ]]; then
+    echo
+    local sargs=(--role "$node_role" --mode status)
+    [[ "$node_role" == "entry" && -n "${EXIT_IP:-}" ]] && sargs+=(--peer-ip "$EXIT_IP")
+    [[ "$node_role" == "exit" && -n "${ENTRY_IP:-}" ]] && sargs+=(--peer-ip "$ENTRY_IP")
+    bash "$stack_script" "${sargs[@]}" 2>/dev/null || true
   fi
 }
 
@@ -576,6 +624,7 @@ main() {
     exit) install_exit ;;
     entry) install_entry ;;
     status) show_status ;;
+    net-tune) run_net_stack_only ;;
     client)
       # shellcheck disable=SC1090
       [[ -f "$CRED_FILE" ]] && source "$CRED_FILE"
