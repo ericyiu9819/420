@@ -63,16 +63,16 @@ Entry options:
   --reality-sni NAME         Entry 侧 SNI，默认 ${ENTRY_REALITY_SNI}
 
 Common options:
-  --no-net-tune              跳过网络栈优化（默认安装时自动开启）
-  --uplink-mbit N            真实上行带宽（Mbit/s），未指定则自动探测
-  --rtt-ms N                 基线 RTT（ms），未指定则 ping 对端自动测
+  --no-net-tune              跳过网络栈优化（默认安装时自动开启并探测 B/T）
+  --uplink-mbit N            可选：手动覆盖自动探测带宽
+  --rtt-ms N                 可选：手动覆盖自动探测 RTT
   --noninteractive           非交互模式（需补全必填参数）
   -h, --help                 显示帮助
 
-网络栈优化（默认开启，从 B/T/R 基本量推导）：
-  - BDP 自适应 socket 缓冲
-  - 出口 HTB+fq 整形（瓶颈在本机）
-  - 角色化并发参数 + Xray 文件句柄
+网络栈优化（默认开启，全自动探测 B/T，无需用户提供）：
+  - 带宽：网卡速率 + Cloudflare 下载采样；失败用角色先验
+  - 时延：ping 对端/网关/DNS 中位数；失败用角色先验
+  - BDP 推导 socket 缓冲 + 条件性出口 HTB+fq 整形
 
 示例：
   sudo bash $(basename "$0") --mode exit --entry-ip 1.2.3.4
@@ -416,7 +416,7 @@ apply_net_stack() {
     args+=(--peer-ip "$ENTRY_IP")
   fi
 
-  log "从基本量推导并应用网络栈（role=${role}）..."
+  log "从基本量自动探测并应用网络栈（role=${role}，无需手动提供 B/T）..."
   bash "$stack_script" "${args[@]}"
 }
 
