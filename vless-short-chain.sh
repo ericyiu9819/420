@@ -6,13 +6,11 @@
 #   不使用 xtls-rprx-vision（Vision 拒绝 TCP Mux）
 #
 # 子脚本:
-#   vless-short-reality-install.sh  — 链路安装
-#   vless-chain-net-stack.sh        — --profile short
+#   vless-short-reality-install.sh  — 链路安装，网络优化也在这个脚本里
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_SH="${SCRIPT_DIR}/vless-short-reality-install.sh"
-NET_SH="${SCRIPT_DIR}/vless-chain-net-stack.sh"
 
 usage() {
   cat <<EOF
@@ -23,7 +21,7 @@ Usage: $(basename "$0") <command> [options]
 Commands:
   install-exit    安装 Exit（第一步，出口 VPS）
   install-entry   安装 Entry（第二步，入口 VPS）
-  net-stack       单独应用短连接网络栈
+  net-stack       应用短连接网络优化（承载 pacing、连接表、条件 BDP）
   status          查看 xray + 凭据 + 网络栈
   client          输出客户端 JSON（含 Mux）与链接
   restore-net     回滚网络栈
@@ -40,9 +38,10 @@ Commands:
   sudo bash $(basename "$0") install-entry --cred-file ./chain-handoff.env
 
 说明:
+  - 安装时会做网络优化：bbrplus/bbr + 出口 fq，Entry/Exit 连接表按角色设置，
+    Xray 每连接缓冲 8KB。给出 --uplink-mbit 且测到对端时延后，才写 BDP 并整形
   - 客户端必须打开 Mux。只导入 vless:// 链接不会启用 Mux
-  - 已知出口速率时再加 --uplink-mbit；未实测则不改套接字缓冲、不做整形
-  - 跳过网络栈: install-exit/install-entry 加 --no-net-tune
+  - 跳过网络优化: install-exit/install-entry 加 --no-net-tune
 
 EOF
 }
@@ -51,7 +50,6 @@ die() { echo "[vless-short] ERROR: $*" >&2; exit 1; }
 
 require_scripts() {
   [[ -f "$INSTALL_SH" ]] || die "缺少 ${INSTALL_SH}"
-  [[ -f "$NET_SH" ]] || die "缺少 ${NET_SH}"
 }
 
 main() {
@@ -88,7 +86,7 @@ main() {
         fi
       fi
       [[ -n "$role" ]] || die "请指定 --role entry|exit，或先完成节点安装"
-      bash "$NET_SH" --profile short --role "$role" --mode apply "${args[@]}"
+      bash "$INSTALL_SH" --mode optimize --role "$role" "${args[@]}"
       ;;
     status)
       shift
@@ -110,7 +108,7 @@ main() {
           *) die "未知参数: $1" ;;
         esac
       done
-      bash "$NET_SH" --profile short --role "$role" --mode restore
+      bash "$INSTALL_SH" --mode restore-net --role "$role"
       ;;
     self-test)
       require_scripts

@@ -13,6 +13,12 @@
 #   7. 目的地握手省不掉。Exit 的 freedom 打开 TFO，只对支持的目的地少一次 RTT
 #   8. 入站 Keep-Alive 默认关闭，承载会在两次短流之间被中间设备拆掉，所以入站显式打开
 #   9. shortId 只放生成值。Exit 私钥留在 Exit，拷走的 handoff 只有公钥
+#  网络性能（同一脚本内）:
+#  10. 承载是少数长 TCP。有 bbrplus 就用它，否则用 bbr，再否则 cubic，
+#      并把出口队列换成 fq，BBR 的 pacing 才在当前网卡上生效
+#  11. 短流在用户态默认有 512KB 缓冲，响应会在里面多待一轮。Xray bufferSize 收到 8KB
+#  12. 连接表只跟角色有关：Entry 放大监听队列，Exit 放大 conntrack 和包积压
+#  13. 套接字上限和 HTB/cake 整形只在上行与对端时延都实测之后写入
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,6 +37,15 @@ XUDP_CONCURRENCY=16
 XUDP_UDP443="reject"
 KEEPALIVE_IDLE=45
 KEEPALIVE_INTERVAL=45
+# Xray 每条连接的用户态缓冲，单位 KB。短响应远小于默认 512KB。
+XRAY_BUFFER_KB=8
+NET_STATE_DIR="/var/lib/vless-short/net"
+NET_SYSCTL_FILE="/etc/sysctl.d/99-vless-short-net.conf"
+XRAY_UNIT="/etc/systemd/system/xray.service"
+PRIOR_B_ENTRY=1000
+PRIOR_B_EXIT=1000
+PRIOR_T_ENTRY=150
+PRIOR_T_EXIT=80
 
 MODE=""
 CRED_FILE=""
@@ -52,6 +67,18 @@ NET_TUNE="1"
 UPLINK_MBIT=""
 RTT_MS=""
 NONINTERACTIVE="0"
+ROLE=""
+IFACE=""
+PEER_IP=""
+DRY_RUN="0"
+PROBE_BANDWIDTH="1"
+PROBE_RTT="1"
+RESTART_XRAY="1"
+CONF_BAND=0
+CONF_RTT=0
+APPLY_BDP=0
+APPLY_SHAPE=0
+QDISC_ACTION="keep"
 
 usage() {
   cat <<EOF
@@ -62,9 +89,12 @@ Usage: $(basename "$0") --mode <mode> [options]
 Modes:
   exit       安装 Exit（第一步）
   entry      安装 Entry（第二步）
-  status     xray + 凭据 + 网络栈
-  client     输出客户端 JSON 与链接
-  self-test  校验配置生成（不需要 root）
+  status      xray + 凭据 + 网络优化
+  client      输出客户端 JSON 与链接
+  optimize    只做短连接网络优化（安装时会自动做）
+  restore-net 回滚本脚本写入的网络优化
+  net-status  只看网络优化推导
+  self-test   校验配置与推导（不需要 root）
 
 Exit:
   --entry-ip IP             Entry 公网 IP（防火墙白名单，必填）
@@ -80,8 +110,14 @@ Entry:
 
 Common:
   --no-net-tune
-  --uplink-mbit N           已测出口速率，才会写 BDP 缓冲并整形
+  --uplink-mbit N           已测出口速率。和实测时延同时具备才写 BDP、才整形
   --rtt-ms N                覆盖对端承载时延
+  --role entry|exit         optimize / restore-net / net-status 必填
+  --peer-ip IP              承载对端，用于测量时延
+  --iface NAME
+  --dry-run
+  --no-probe-bandwidth
+  --no-probe-rtt
   --noninteractive
   -h, --help
 EOF
@@ -114,12 +150,18 @@ parse_args() {
       --no-net-tune) NET_TUNE="0"; shift ;;
       --uplink-mbit) UPLINK_MBIT="$2"; shift 2 ;;
       --rtt-ms) RTT_MS="$2"; shift 2 ;;
+      --role) ROLE="$2"; shift 2 ;;
+      --peer-ip) PEER_IP="$2"; shift 2 ;;
+      --iface) IFACE="$2"; shift 2 ;;
+      --dry-run) DRY_RUN="1"; shift ;;
+      --no-probe-bandwidth) PROBE_BANDWIDTH="0"; shift ;;
+      --no-probe-rtt) PROBE_RTT="0"; shift ;;
       --noninteractive) NONINTERACTIVE="1"; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "未知参数: $1" ;;
     esac
   done
-  [[ -n "$MODE" ]] || die "必须 --mode exit|entry|status|client|self-test"
+  [[ -n "$MODE" ]] || die "必须 --mode exit|entry|status|client|optimize|restore-net|net-status|self-test"
 }
 
 detect_os() {
@@ -202,11 +244,18 @@ bearer_sockopt() {
 EOF
 }
 
+policy_json() {
+  cat <<EOF
+"policy": { "levels": { "0": { "handshake": 4, "connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 5, "bufferSize": ${XRAY_BUFFER_KB} } } }
+EOF
+}
+
 write_exit_config() {
   mkdir -p "$XRAY_DIR" "$LOG_DIR"
   cat >"$XRAY_CONFIG" <<EOF
 {
   "log": { "loglevel": "warning", "access": "${LOG_DIR}/access.log", "error": "${LOG_DIR}/error.log" },
+  $(policy_json),
   "inbounds": [{
     "tag": "vless-from-entry", "listen": "0.0.0.0", "port": ${PORT},
     "protocol": "vless",
@@ -243,6 +292,7 @@ write_entry_config() {
   cat >"$XRAY_CONFIG" <<EOF
 {
   "log": { "loglevel": "warning", "access": "${LOG_DIR}/access.log", "error": "${LOG_DIR}/error.log" },
+  $(policy_json),
   "inbounds": [{
     "tag": "vless-in", "listen": "0.0.0.0", "port": ${PORT},
     "protocol": "vless",
@@ -334,16 +384,326 @@ setup_firewall_entry() {
   fi
 }
 
-apply_net_stack() {
-  local role="$1" script="${SCRIPT_DIR}/vless-chain-net-stack.sh" args=(--profile short --role "$role" --mode apply)
-  [[ "$NET_TUNE" == "1" ]] || { log "跳过网络栈 (--no-net-tune)"; return 0; }
-  [[ -f "$script" ]] || { log "缺少 ${script}"; return 0; }
-  [[ -n "$UPLINK_MBIT" ]] && args+=(--uplink-mbit "$UPLINK_MBIT")
-  [[ -n "$RTT_MS" ]] && args+=(--rtt-ms "$RTT_MS")
-  [[ "$role" == "entry" && -n "$EXIT_IP" ]] && args+=(--peer-ip "$EXIT_IP")
-  [[ "$role" == "exit" && -n "$ENTRY_IP" ]] && args+=(--peer-ip "$ENTRY_IP")
-  log "应用短连接网络栈 role=${role} ..."
-  bash "$script" "${args[@]}"
+net_run() {
+  [[ "$DRY_RUN" == "1" ]] && { echo "[dry-run] $*"; return 0; }
+  eval "$@"
+}
+
+net_clamp() {
+  local v="$1" lo="$2" hi="$3"
+  (( v < lo )) && v=$lo
+  (( v > hi )) && v=$hi
+  echo "$v"
+}
+
+net_detect_iface() {
+  [[ -n "$IFACE" ]] && return 0
+  command -v ip >/dev/null 2>&1 || die "缺少 ip"
+  IFACE="$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $5}')"
+  [[ -n "$IFACE" ]] || die "无法检测网卡，请 --iface"
+}
+
+net_mem_kb() { awk '/MemTotal/ {print $2}' /proc/meminfo; }
+
+net_pick_cc() {
+  local avail active
+  if [[ "$DRY_RUN" != "1" ]]; then
+    modprobe tcp_bbr 2>/dev/null || true
+  else
+    echo "[dry-run] modprobe tcp_bbr"
+  fi
+  avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo cubic)"
+  active="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")"
+  if grep -qw bbrplus <<<"$avail"; then CC="bbrplus"
+  elif grep -qw bbr <<<"$avail"; then CC="bbr"
+  elif grep -qw cubic <<<"$avail"; then CC="cubic"
+  else CC="${active:-cubic}"; fi
+  [[ -n "$CC" ]] || CC="cubic"
+}
+
+net_bandwidth_prior() {
+  if [[ "$ROLE" == "entry" ]]; then UPLINK_MBIT="$PRIOR_B_ENTRY"; else UPLINK_MBIT="$PRIOR_B_EXIT"; fi
+  CONF_BAND=20
+}
+
+net_rtt_prior() {
+  if [[ "$ROLE" == "entry" ]]; then RTT_MS="$PRIOR_T_ENTRY"; else RTT_MS="$PRIOR_T_EXIT"; fi
+  CONF_RTT=20
+}
+
+net_ping_ms() {
+  local avg
+  avg="$(ping -c 4 -i 0.2 -W 1 "$1" 2>/dev/null | awk -F'/' '/min\/avg/ {print $5}' | cut -d. -f1)"
+  [[ "$avg" =~ ^[0-9]+$ ]] && (( avg > 0 )) || return 1
+  echo "$avg"
+}
+
+net_measure() {
+  if [[ -n "${UPLINK_SET:-}" ]]; then
+    CONF_BAND=100
+  else
+    net_bandwidth_prior
+    log "上行未实测，不用网卡速率或下载采样代替"
+  fi
+  if [[ -n "${RTT_SET:-}" ]]; then
+    CONF_RTT=100
+  elif [[ "$PROBE_RTT" == "1" && -n "$PEER_IP" ]] && command -v ping >/dev/null 2>&1; then
+    local ms
+    ms="$(net_ping_ms "$PEER_IP" || true)"
+    if [[ "$ms" =~ ^[0-9]+$ ]]; then
+      RTT_MS="$ms"
+      CONF_RTT=80
+      log "时延: 对端承载 ${PEER_IP} → ${RTT_MS}ms"
+    else
+      net_rtt_prior
+    fi
+  else
+    net_rtt_prior
+  fi
+}
+
+net_derive() {
+  local mem n_sock per_cap
+  mem="$(net_mem_kb)"
+  net_pick_cc
+  BDP_BYTES=$(( UPLINK_MBIT * 1000000 * RTT_MS / 1000 / 8 ))
+  SOCK_MAX=$(( BDP_BYTES * 2 ))
+  if [[ "$ROLE" == "entry" ]]; then
+    n_sock=64
+    SOMAXCONN=4096; SYN_BACKLOG=4096; CT_MAX=8192; DEV_BACKLOG=4096
+  else
+    n_sock=1024
+    SOMAXCONN=1024; SYN_BACKLOG=1024; CT_MAX=262144; DEV_BACKLOG=16384
+  fi
+  if (( mem < 1048576 )); then
+    if [[ "$ROLE" == "entry" ]]; then
+      SOMAXCONN=1024; SYN_BACKLOG=1024; CT_MAX=4096; DEV_BACKLOG=1024
+    else
+      SOMAXCONN=512; SYN_BACKLOG=512; CT_MAX=32768; DEV_BACKLOG=4096
+    fi
+  fi
+  per_cap=$(( mem * 1024 / n_sock ))
+  SOCK_MAX="$(net_clamp "$SOCK_MAX" 65536 "$per_cap")"
+  SOCK_DEF=16384
+  SOCK_DEF="$(net_clamp "$SOCK_DEF" 4096 "$SOCK_MAX")"
+  SHAPED_MBIT=$(( UPLINK_MBIT * 95 / 100 ))
+  (( SHAPED_MBIT < 1 )) && SHAPED_MBIT=1
+  SHAPED_KBIT=$(( SHAPED_MBIT * 1000 ))
+  BURST_BYTES="$(net_clamp $(( SHAPED_KBIT * 1000 / 8 / 100 )) 32768 1048576)"
+  FQ_LIMIT="$(net_clamp $(( BDP_BYTES / 1500 )) 128 4096)"
+  FILE_MAX=$(( CT_MAX * 4 ))
+  (( FILE_MAX < 65536 )) && FILE_MAX=65536
+  XRAY_NOFILE=$(( CT_MAX * 2 ))
+  (( XRAY_NOFILE < 65536 )) && XRAY_NOFILE=65536
+  TW_BUCKETS="$CT_MAX"
+}
+
+net_decide() {
+  local root=""
+  APPLY_BDP=0
+  APPLY_SHAPE=0
+  if [[ "$CONF_BAND" -ge 40 && "$CONF_RTT" -ge 40 ]]; then
+    APPLY_BDP=1
+    APPLY_SHAPE=1
+  fi
+  if command -v tc >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
+    root="$(tc qdisc show dev "$IFACE" 2>/dev/null | awk 'NR==1 {print $2}')"
+  fi
+  ROOT_QDISC="$root"
+  if [[ "$APPLY_SHAPE" == "1" ]]; then
+    if [[ "$root" == "cake" ]]; then QDISC_ACTION="cake"; else QDISC_ACTION="htb"; fi
+  else
+    case "$root" in
+      cake|fq|htb) QDISC_ACTION="keep" ;;
+      *) QDISC_ACTION="fq" ;;
+    esac
+  fi
+}
+
+net_print() {
+  local buf="套接字缓冲:  保持内核默认"
+  local q="出口队列:    ${QDISC_ACTION}"
+  [[ "$APPLY_BDP" == "1" ]] && buf="套接字缓冲:  默认 ${SOCK_DEF}，上限 ${SOCK_MAX}"
+  [[ "$QDISC_ACTION" == "htb" ]] && q="出口队列:    HTB+fq @ ${SHAPED_MBIT}Mbps"
+  [[ "$QDISC_ACTION" == "cake" ]] && q="出口队列:    cake @ ${SHAPED_MBIT}Mbps"
+  [[ "$QDISC_ACTION" == "fq" ]] && q="出口队列:    fq（不限速，只做 pacing）"
+  [[ "$QDISC_ACTION" == "keep" ]] && q="出口队列:    保持现有 ${ROOT_QDISC:-队列}"
+  cat <<EOF
+
+=== 短连接网络优化 ===
+  角色:          ${ROLE}
+  拥塞控制:      ${CC}
+  上行:          ${UPLINK_MBIT} Mbps（置信度 ${CONF_BAND}%）
+  对端时延:      ${RTT_MS} ms（置信度 ${CONF_RTT}%）
+  ${buf}
+  ${q}
+  somaxconn:     ${SOMAXCONN}
+  conntrack:     ${CT_MAX}
+  网卡积压:      ${DEV_BACKLOG}
+  Xray 缓冲:     ${XRAY_BUFFER_KB} KB/连接
+  Xray NOFILE:   ${XRAY_NOFILE}
+
+EOF
+}
+
+net_plan() {
+  net_detect_iface
+  net_measure
+  net_derive
+  net_decide
+  net_print
+}
+
+net_sysctl_lines() {
+  cat <<EOF
+# vless-short role=${ROLE} $(date -u +"%FT%TZ")
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = ${CC}
+net.ipv4.tcp_ecn = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_max_tw_buckets = ${TW_BUCKETS}
+net.core.somaxconn = ${SOMAXCONN}
+net.ipv4.tcp_max_syn_backlog = ${SYN_BACKLOG}
+net.core.netdev_max_backlog = ${DEV_BACKLOG}
+net.ipv4.ip_local_port_range = 1024 65535
+fs.file-max = ${FILE_MAX}
+EOF
+  if [[ "$APPLY_BDP" == "1" ]]; then
+    cat <<EOF
+net.core.rmem_max = ${SOCK_MAX}
+net.core.wmem_max = ${SOCK_MAX}
+net.ipv4.tcp_rmem = 4096 ${SOCK_DEF} ${SOCK_MAX}
+net.ipv4.tcp_wmem = 4096 ${SOCK_DEF} ${SOCK_MAX}
+EOF
+  fi
+}
+
+net_backup() {
+  [[ "$DRY_RUN" == "1" ]] && return 0
+  mkdir -p "$NET_STATE_DIR"
+  [[ -f "${NET_STATE_DIR}/sysctl.before" ]] && return 0
+  local k
+  {
+    echo "IFACE=${IFACE}"
+    for k in net.core.default_qdisc net.ipv4.tcp_congestion_control net.ipv4.tcp_ecn \
+      net.ipv4.tcp_fastopen net.ipv4.tcp_mtu_probing net.ipv4.tcp_slow_start_after_idle \
+      net.ipv4.tcp_notsent_lowat net.ipv4.tcp_fin_timeout net.ipv4.tcp_tw_reuse \
+      net.ipv4.tcp_max_tw_buckets net.core.somaxconn net.ipv4.tcp_max_syn_backlog \
+      net.core.netdev_max_backlog net.ipv4.ip_local_port_range fs.file-max \
+      net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do
+      echo "${k}=$(sysctl -n "$k" 2>/dev/null || true)"
+    done
+  } >"${NET_STATE_DIR}/sysctl.before"
+  tc qdisc show dev "$IFACE" >"${NET_STATE_DIR}/tc.before" 2>/dev/null || true
+}
+
+net_apply_sysctl() {
+  log "写入 ${NET_SYSCTL_FILE}"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    net_sysctl_lines | sed 's/^/[dry-run] /'
+    return 0
+  fi
+  mkdir -p "$(dirname "$NET_SYSCTL_FILE")"
+  net_sysctl_lines >"$NET_SYSCTL_FILE"
+  sysctl -p "$NET_SYSCTL_FILE" >/dev/null
+  if [[ -w /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+    sysctl -w "net.netfilter.nf_conntrack_max=${CT_MAX}" >/dev/null
+    echo "net.netfilter.nf_conntrack_max = ${CT_MAX}" >>"$NET_SYSCTL_FILE"
+  fi
+}
+
+net_apply_qdisc() {
+  case "$QDISC_ACTION" in
+    keep) log "保持现有出口队列 ${ROOT_QDISC:-}" ;;
+    fq)
+      log "出口 ${IFACE} 换为 fq"
+      net_run "tc qdisc replace dev '${IFACE}' root fq"
+      ;;
+    htb)
+      log "出口 ${IFACE} 整形 ${SHAPED_MBIT}Mbps"
+      net_run "tc qdisc replace dev '${IFACE}' root handle 1: htb default 10"
+      net_run "tc class replace dev '${IFACE}' parent 1: classid 1:10 htb rate ${SHAPED_KBIT}kbit ceil ${SHAPED_KBIT}kbit burst ${BURST_BYTES}"
+      net_run "tc qdisc replace dev '${IFACE}' parent 1:10 handle 10: fq limit ${FQ_LIMIT}"
+      ;;
+    cake)
+      log "出口 ${IFACE} cake 带宽 ${SHAPED_MBIT}Mbps"
+      net_run "tc qdisc replace dev '${IFACE}' root cake bandwidth ${SHAPED_KBIT}kbit rtt ${RTT_MS}ms"
+      ;;
+  esac
+}
+
+net_tune_unit() {
+  [[ -f "$XRAY_UNIT" ]] || return 0
+  log "Xray LimitNOFILE=${XRAY_NOFILE}"
+  [[ "$DRY_RUN" == "1" ]] && return 0
+  if grep -q '^LimitNOFILE=' "$XRAY_UNIT"; then
+    sed -i "s/^LimitNOFILE=.*/LimitNOFILE=${XRAY_NOFILE}/" "$XRAY_UNIT"
+  else
+    sed -i "/^\[Service\]/a LimitNOFILE=${XRAY_NOFILE}" "$XRAY_UNIT"
+  fi
+  systemctl daemon-reload
+  if [[ "$RESTART_XRAY" == "1" ]] && systemctl is-active --quiet xray 2>/dev/null; then
+    systemctl restart xray || true
+  fi
+}
+
+optimize_net() {
+  [[ "$ROLE" == "entry" || "$ROLE" == "exit" ]] || die "网络优化需要 --role entry|exit"
+  command -v sysctl >/dev/null 2>&1 || die "缺少 sysctl"
+  UPLINK_SET="$UPLINK_MBIT"
+  RTT_SET="$RTT_MS"
+  net_plan
+  net_backup
+  net_apply_sysctl
+  net_apply_qdisc
+  net_tune_unit
+  log "网络优化完成"
+}
+
+net_status() {
+  [[ "$ROLE" == "entry" || "$ROLE" == "exit" ]] || return 0
+  UPLINK_SET="$UPLINK_MBIT"
+  RTT_SET="$RTT_MS"
+  net_plan || true
+  echo "=== 当前内核 ==="
+  sysctl net.core.default_qdisc net.ipv4.tcp_congestion_control \
+    net.ipv4.tcp_slow_start_after_idle net.core.somaxconn \
+    net.ipv4.ip_local_port_range net.core.rmem_max 2>/dev/null || true
+  echo
+  tc qdisc show dev "$IFACE" 2>/dev/null || true
+}
+
+restore_net() {
+  [[ "$ROLE" == "entry" || "$ROLE" == "exit" ]] || die "回滚需要 --role entry|exit"
+  net_detect_iface
+  [[ -f "${NET_STATE_DIR}/sysctl.before" ]] || die "没有网络优化备份"
+  local line key val
+  while IFS= read -r line; do
+    [[ "$line" == IFACE=* ]] && { IFACE="${line#IFACE=}"; continue; }
+    key="${line%%=*}"
+    val="${line#*=}"
+    [[ -n "$key" && -n "$val" ]] || continue
+    net_run "sysctl -w ${key}='${val}'"
+  done <"${NET_STATE_DIR}/sysctl.before"
+  net_run "rm -f '${NET_SYSCTL_FILE}'"
+  net_run "tc qdisc del dev '${IFACE}' root 2>/dev/null || true"
+  rm -f "${NET_STATE_DIR}/sysctl.before"
+  log "网络优化已回滚"
+}
+
+apply_optimize() {
+  [[ "$NET_TUNE" == "1" ]] || { log "跳过网络优化 (--no-net-tune)"; return 0; }
+  ROLE="$1"
+  RESTART_XRAY=0
+  if [[ "$ROLE" == "entry" && -z "$PEER_IP" ]]; then PEER_IP="${EXIT_IP:-}"; fi
+  if [[ "$ROLE" == "exit" && -z "$PEER_IP" ]]; then PEER_IP="${ENTRY_IP:-}"; fi
+  log "应用短连接网络优化 role=${ROLE}"
+  optimize_net
 }
 
 restart_xray() {
@@ -370,6 +730,7 @@ write_client_json() {
   cat >"$CLIENT_JSON" <<EOF
 {
   "log": { "loglevel": "warning" },
+  $(policy_json),
   "inbounds": [{
     "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
     "settings": { "udp": true }
@@ -493,13 +854,15 @@ show_status() {
     source "$STATE_FILE"
     role="${NODE_ROLE:-}"
   fi
-  local ns="${SCRIPT_DIR}/vless-chain-net-stack.sh"
-  if [[ -f "$ns" && -n "$role" ]]; then
+  if [[ -n "$role" ]]; then
     echo
-    local a=(--profile short --role "$role" --mode status)
-    [[ "$role" == "entry" && -n "${EXIT_IP:-}" ]] && a+=(--peer-ip "$EXIT_IP")
-    [[ "$role" == "exit" && -n "${ENTRY_IP:-}" ]] && a+=(--peer-ip "$ENTRY_IP")
-    bash "$ns" "${a[@]}" 2>/dev/null || true
+    ROLE="$role"
+    PEER_IP=""
+    UPLINK_MBIT=""
+    RTT_MS=""
+    [[ "$role" == "entry" ]] && PEER_IP="${EXIT_IP:-}"
+    [[ "$role" == "exit" ]] && PEER_IP="${ENTRY_IP:-}"
+    net_status || true
   fi
 }
 
@@ -510,8 +873,8 @@ install_exit() {
   EXIT_UUID="$(gen_uuid)"; EXIT_SHORT_ID="$(gen_short_id)"
   read -r EXIT_PRIVATE_KEY EXIT_PUBLIC_KEY < <(parse_x25519)
   write_exit_config; setup_firewall_exit
+  apply_optimize exit
   restart_xray
-  apply_net_stack exit
   save_exit_files
   cat <<EOF
 
@@ -540,8 +903,8 @@ install_entry() {
   ENTRY_UUID="$(gen_uuid)"; ENTRY_SHORT_ID="$(gen_short_id)"
   read -r ENTRY_PRIVATE_KEY ENTRY_PUBLIC_KEY < <(parse_x25519)
   write_entry_config; setup_firewall_entry
+  apply_optimize entry
   restart_xray
-  apply_net_stack entry
   save_entry_files
   show_client
   echo "=== Entry 安装完成（短连接）=== 日志: journalctl -u xray -f"
@@ -585,6 +948,7 @@ assert ids == ["aabbccdd"], ids
 assert "sniffing" not in inbound
 assert cfg["outbounds"][0]["streamSettings"]["sockopt"]["tcpFastOpen"] is True
 assert inbound["streamSettings"]["sockopt"]["tcpKeepAliveIdle"] == 45
+assert cfg["policy"]["levels"]["0"]["bufferSize"] == 8
 PY
 
   save_exit_files
@@ -617,6 +981,7 @@ assert mux["xudpConcurrency"] == int(sys.argv[3])
 assert mux["xudpProxyUDP443"] == "reject"
 assert "xtls-rprx-vision" not in json.dumps(cfg)
 assert "sniffing" not in json.dumps(cfg)
+assert cfg["policy"]["levels"]["0"]["bufferSize"] == 8
 PY
 
   write_client_json "203.0.113.20"
@@ -629,6 +994,7 @@ assert "flow" not in user
 mux = cfg["outbounds"][0]["mux"]
 assert mux["enabled"] is True and mux["concurrency"] == int(sys.argv[2])
 assert cfg["inbounds"][0]["settings"]["udp"] is True
+assert cfg["policy"]["levels"]["0"]["bufferSize"] == 8
 PY
 
   CRED_FILE="$HANDOFF_FILE"
@@ -642,21 +1008,69 @@ PY
     die "含私钥的 handoff 应被拒绝"
   fi
 
+  ROLE=exit
+  IFACE=lo
+  UPLINK_MBIT=200
+  RTT_MS=40
+  UPLINK_SET=200
+  RTT_SET=40
+  PEER_IP=""
+  PROBE_BANDWIDTH=0
+  PROBE_RTT=0
+  net_plan >/dev/null
+  [[ "$APPLY_BDP" == "1" && "$APPLY_SHAPE" == "1" ]] || die "实测 B×T 应开启缓冲和整形"
+  [[ "$SOCK_MAX" == "2000000" ]] || die "SOCK_MAX=${SOCK_MAX}"
+  [[ "$SOCK_DEF" == "16384" ]] || die "短流默认缓冲应为 16384，实际 ${SOCK_DEF}"
+  [[ "$SOMAXCONN" == "1024" && "$CT_MAX" == "262144" ]] || die "exit 连接表不符合角色"
+  [[ "$SHAPED_MBIT" == "190" ]] || die "整形应为上行的 95%"
+
+  UPLINK_MBIT=""
+  RTT_MS=""
+  UPLINK_SET=""
+  RTT_SET=""
+  net_plan >/dev/null
+  [[ "$APPLY_BDP" == "0" && "$APPLY_SHAPE" == "0" ]] || die "未实测不应写 BDP"
+  [[ "$SOMAXCONN" == "1024" ]] || die "未实测时 exit 监听队列被改掉"
+
+  UPLINK_MBIT=200
+  UPLINK_SET=200
+  RTT_MS=""
+  RTT_SET=""
+  net_plan >/dev/null
+  [[ "$APPLY_BDP" == "0" ]] || die "只有上行、没有时延时不应写缓冲"
+
+  ROLE=entry
+  UPLINK_MBIT=""
+  UPLINK_SET=""
+  net_plan >/dev/null
+  [[ "$SOMAXCONN" == "4096" && "$CT_MAX" == "8192" && "$DEV_BACKLOG" == "4096" ]] || die "entry 连接表不符合角色"
+
   rm -rf "$tmp"
   log "self-test 通过"
 }
 
 main() {
   parse_args "$@"
-  if [[ "$MODE" == "self-test" ]]; then
-    run_self_test
-    return
-  fi
+  case "$MODE" in
+    self-test)
+      run_self_test
+      return
+      ;;
+    optimize)
+      if [[ "$DRY_RUN" == "1" ]]; then
+        optimize_net
+        return
+      fi
+      ;;
+  esac
   require_root
   case "$MODE" in
     exit) install_exit ;;
     entry) install_entry ;;
     status) show_status ;;
+    optimize) optimize_net ;;
+    net-status) net_status ;;
+    restore-net) restore_net ;;
     client)
       # shellcheck disable=SC1090
       [[ -f "$STATE_FILE" ]] && source "$STATE_FILE"

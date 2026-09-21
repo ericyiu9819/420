@@ -563,8 +563,31 @@ apply_all() {
   log "完成"
 }
 
+delegate_short_profile() {
+  [[ "$PROFILE" == "short" ]] || return 1
+  local here target mode args
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  target="${here}/vless-short-reality-install.sh"
+  [[ -f "$target" ]] || return 1
+  mode="optimize"
+  [[ "$MODE" == "restore" ]] && mode="restore-net"
+  [[ "$MODE" == "status" ]] && mode="net-status"
+  args=(--mode "$mode" --role "$ROLE")
+  [[ -n "$UPLINK_MBIT" ]] && args+=(--uplink-mbit "$UPLINK_MBIT")
+  [[ -n "$RTT_MS" ]] && args+=(--rtt-ms "$RTT_MS")
+  [[ -n "$PEER_IP" ]] && args+=(--peer-ip "$PEER_IP")
+  [[ -n "$IFACE" ]] && args+=(--iface "$IFACE")
+  [[ "$DRY_RUN" == "1" ]] && args+=(--dry-run)
+  [[ "$PROBE_BANDWIDTH" == "0" ]] && args+=(--no-probe-bandwidth)
+  [[ "$PROBE_RTT" == "0" ]] && args+=(--no-probe-rtt)
+  exec bash "$target" "${args[@]}"
+}
+
 main() {
   parse_args "$@"
+  if delegate_short_profile; then
+    return 0
+  fi
   case "$MODE" in
     apply) apply_all ;;
     status)
