@@ -8,6 +8,10 @@
 #   P1  长连接代理 sysctl (slow_start_after_idle=0, tw_reuse, ...)
 #   P1  出口 HTB+fq 整形 (仅带宽置信度 ≥ 40%)
 #   P2  Xray LimitNOFILE
+#
+# --profile short:
+#   外层承载仍是少量长 TCP，内层是短流。B×T 只有在上行和对端时延都实测时
+#   才写套接字上限；默认缓冲保持小值。连接表按角色写，不靠带宽先验。
 set -euo pipefail
 
 STATE_DIR="/var/lib/vless-chain/net-stack"
@@ -16,6 +20,7 @@ UNIT_FILE="/etc/systemd/system/xray.service"
 
 ROLE=""
 MODE="apply"
+PROFILE="long"
 UPLINK_MBIT=""
 RTT_MS=""
 PEER_IP=""
@@ -50,6 +55,7 @@ Modes:
 
 Options:
   --role entry|exit
+  --profile long|short  long=低连接（默认），short=短连接承载
   --uplink-mbit N       覆盖自动探测带宽
   --rtt-ms N            覆盖自动探测 RTT
   --peer-ip IP          RTT 首选 ping 目标
@@ -86,6 +92,7 @@ parse_args() {
     case "$1" in
       --role) ROLE="$2"; shift 2 ;;
       --mode) MODE="$2"; shift 2 ;;
+      --profile) PROFILE="$2"; shift 2 ;;
       --uplink-mbit) UPLINK_MBIT="$2"; shift 2 ;;
       --rtt-ms) RTT_MS="$2"; shift 2 ;;
       --peer-ip) PEER_IP="$2"; shift 2 ;;
@@ -98,6 +105,7 @@ parse_args() {
     esac
   done
   [[ "$ROLE" == "entry" || "$ROLE" == "exit" ]] || die "必须 --role entry|exit"
+  [[ "$PROFILE" == "long" || "$PROFILE" == "short" ]] || die "必须 --profile long|short"
 }
 
 detect_iface() {
@@ -131,8 +139,33 @@ use_bandwidth_prior() {
   log "带宽: 使用 ${ROLE} 先验 ${UPLINK_MBIT} Mbps"
 }
 
+probe_bandwidth_short() {
+  local link_mbit=""
+  if [[ "$PROBE_BANDWIDTH" != "1" ]]; then
+    use_bandwidth_prior
+    UPLINK_MBIT="$(clamp "$UPLINK_MBIT" 10 10000)"
+    return
+  fi
+  if [[ -r "/sys/class/net/${IFACE}/speed" ]]; then
+    link_mbit="$(cat "/sys/class/net/${IFACE}/speed" 2>/dev/null || true)"
+    [[ "$link_mbit" =~ ^[0-9]+$ ]] && (( link_mbit > 0 )) || link_mbit=""
+  fi
+  use_bandwidth_prior
+  if [[ -n "$link_mbit" && "$link_mbit" -ge 10 && "$link_mbit" -lt 10000 ]]; then
+    log "带宽: 网卡 ${link_mbit}Mbps 只是出口上限，短连接剖面不用它冒充已测上行"
+  else
+    log "带宽: 没有已测上行，保持 ${ROLE} 先验 ${UPLINK_MBIT}Mbps"
+  fi
+  UPLINK_MBIT="$(clamp "$UPLINK_MBIT" 10 10000)"
+}
+
 probe_bandwidth_mbit() {
   local link_mbit="" samples=() s best from_link
+
+  if [[ "$PROFILE" == "short" ]]; then
+    probe_bandwidth_short
+    return
+  fi
 
   if [[ "$PROBE_BANDWIDTH" != "1" ]]; then use_bandwidth_prior; UPLINK_MBIT="$(clamp "$UPLINK_MBIT" 10 10000)"; return; fi
 
@@ -192,8 +225,32 @@ use_rtt_prior() {
   log "时延: 使用 ${ROLE} 先验 ${RTT_MS}ms"
 }
 
+probe_rtt_short() {
+  local median=""
+  if [[ "$PROBE_RTT" != "1" ]]; then use_rtt_prior; return; fi
+  if [[ -z "$PEER_IP" ]]; then
+    use_rtt_prior
+    log "时延: 短连接剖面只测对端承载，未提供 --peer-ip"
+    return
+  fi
+  if command -v ping >/dev/null 2>&1; then
+    median="$(ping_median_ms "$PEER_IP" || true)"
+    if [[ "$median" =~ ^[0-9]+$ ]] && (( median > 0 )); then
+      RTT_MS="$median"
+      CONF_RTT=80
+      log "时延: 对端承载 ${PEER_IP} → ${RTT_MS}ms"
+      return
+    fi
+  fi
+  use_rtt_prior
+}
+
 probe_rtt_ms() {
   local gw median targets=()
+  if [[ "$PROFILE" == "short" ]]; then
+    probe_rtt_short
+    return
+  fi
   if [[ "$PROBE_RTT" != "1" ]]; then use_rtt_prior; return; fi
 
   gw="$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $3}')"
@@ -259,10 +316,47 @@ derive_params() {
   FILE_MAX=$(( SOMAXCONN * 32 )); (( FILE_MAX < 1048576 )) && FILE_MAX=1048576
   XRAY_NOFILE=$(( SOMAXCONN * 4 )); (( XRAY_NOFILE < 524288 )) && XRAY_NOFILE=524288
 
+  if [[ "$PROFILE" == "short" ]]; then
+    local n_sock=64 per_cap
+    [[ "$ROLE" == "exit" ]] && n_sock=1024
+    per_cap=$(( mem * 1024 / n_sock ))
+    SOCK_MAX="$(clamp "$SOCK_MAX" 65536 "$per_cap")"
+    SOCK_DEF=16384
+    SOCK_DEF="$(clamp "$SOCK_DEF" 4096 "$SOCK_MAX")"
+    if [[ "$ROLE" == "entry" ]]; then
+      SOMAXCONN=4096; SYN_BACKLOG=4096; CT_MAX=8192
+    else
+      SOMAXCONN=1024; SYN_BACKLOG=1024; CT_MAX=262144
+    fi
+    if (( mem < 1048576 )); then
+      if [[ "$ROLE" == "entry" ]]; then
+        SOMAXCONN=1024; SYN_BACKLOG=1024; CT_MAX=4096
+      else
+        SOMAXCONN=512; SYN_BACKLOG=512; CT_MAX=32768
+      fi
+    fi
+    FILE_MAX=$(( CT_MAX * 4 ))
+    (( FILE_MAX < 65536 )) && FILE_MAX=65536
+    XRAY_NOFILE=$(( CT_MAX * 2 ))
+    (( XRAY_NOFILE < 65536 )) && XRAY_NOFILE=65536
+    TW_BUCKETS="$CT_MAX"
+  fi
+
   pick_congestion_control
 }
 
 decide_qdisc() {
+  if [[ "$PROFILE" == "short" ]]; then
+    if [[ "$CONF_BAND" -ge 40 && "$CONF_RTT" -ge 40 ]]; then
+      APPLY_BDP=1
+      APPLY_QDISC=1
+    else
+      APPLY_BDP=0
+      APPLY_QDISC=0
+    fi
+    return
+  fi
+  APPLY_BDP=1
   if [[ "$SKIP_QDISC_ON_LOW_CONF" == "1" && "$CONF_BAND" -lt 40 ]]; then
     APPLY_QDISC=0
   else
@@ -272,15 +366,21 @@ decide_qdisc() {
 
 print_derivation() {
   local qnote="出口整形:      跳过（带宽置信度 ${CONF_BAND}% < 40%，仅 sysctl）"
+  local sockline="socket max:    ${SOCK_MAX} bytes"
   [[ "$APPLY_QDISC" == "1" ]] && qnote="出口整形:      已启用 HTB+fq @ ${SHAPED_MBIT}Mbps"
+  if [[ "$PROFILE" == "short" && "${APPLY_BDP:-0}" != "1" ]]; then
+    qnote="出口整形:      跳过（上行或对端时延未经实测）"
+    sockline="socket max:    保持内核默认"
+  fi
   cat <<EOF
 
 === 网络栈推导 (B×T×R) ===
+  剖面:          ${PROFILE}
   R 角色:        ${ROLE}
   B 带宽:        ${UPLINK_MBIT} Mbps  (置信度 ${CONF_BAND}%)
   T 时延:        ${RTT_MS} ms         (置信度 ${CONF_RTT}%)
   BDP:           ${BDP_BYTES} bytes
-  socket max:    ${SOCK_MAX} bytes
+  ${sockline}
   fq limit:      ${FQ_LIMIT} pkts
   CC + qdisc:    ${CC} + ${QDISC}
   somaxconn:     ${SOMAXCONN}
@@ -306,7 +406,49 @@ backup_state() {
   tc qdisc show dev "$IFACE" >"${STATE_DIR}/tc.before" 2>/dev/null || true
 }
 
+apply_sysctl_short() {
+  log "短连接 sysctl → ${SYSCTL_FILE}（BDP 写入=${APPLY_BDP}）"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[dry-run] profile=short role=${ROLE} apply_bdp=${APPLY_BDP} ct=${CT_MAX} somaxconn=${SOMAXCONN} nofile=${XRAY_NOFILE}"
+    return 0
+  fi
+  cat >"$SYSCTL_FILE" <<EOF
+# profile=short R=${ROLE} $(date -u +"%FT%TZ")
+net.core.default_qdisc = ${QDISC}
+net.ipv4.tcp_congestion_control = ${CC}
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_max_tw_buckets = ${TW_BUCKETS}
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.core.somaxconn = ${SOMAXCONN}
+net.ipv4.tcp_max_syn_backlog = ${SYN_BACKLOG}
+net.ipv4.ip_local_port_range = 1024 65535
+fs.file-max = ${FILE_MAX}
+EOF
+  if [[ "$APPLY_BDP" == "1" ]]; then
+    cat >>"$SYSCTL_FILE" <<EOF
+# B=${UPLINK_MBIT}Mbps T=${RTT_MS}ms 均为实测
+net.core.rmem_max = ${SOCK_MAX}
+net.core.wmem_max = ${SOCK_MAX}
+net.ipv4.tcp_rmem = 4096 ${SOCK_DEF} ${SOCK_MAX}
+net.ipv4.tcp_wmem = 4096 ${SOCK_DEF} ${SOCK_MAX}
+EOF
+  fi
+  sysctl -p "$SYSCTL_FILE" >/dev/null
+  if [[ -w /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+    run "sysctl -w net.netfilter.nf_conntrack_max=${CT_MAX}"
+    echo "net.netfilter.nf_conntrack_max = ${CT_MAX}" >>"$SYSCTL_FILE"
+  fi
+}
+
 apply_sysctl() {
+  if [[ "$PROFILE" == "short" ]]; then
+    apply_sysctl_short
+    return
+  fi
   log "P0+P1 sysctl → ${SYSCTL_FILE}"
   if [[ "$DRY_RUN" == "0" ]]; then
     cat >"$SYSCTL_FILE" <<EOF
@@ -352,6 +494,7 @@ save_probe_snapshot() {
   [[ "$DRY_RUN" == "1" ]] && return 0
   cat >"${STATE_DIR}/probe.env" <<EOF
 ROLE=${ROLE}
+PROFILE=${PROFILE}
 UPLINK_MBIT=${UPLINK_MBIT}
 RTT_MS=${RTT_MS}
 CONF_BAND=${CONF_BAND}

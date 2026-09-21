@@ -1,54 +1,57 @@
 #!/usr/bin/env bash
-# VLESS 低连接双跳方案 — 统一入口
+# VLESS 短连接双跳 — 统一入口
 #
-# 架构（从基本元素推导）:
-#   Client → Entry[VLESS+Reality] → Exit[VLESS+Reality] → Internet
-#   网络栈: B(带宽) × T(RTT) × R(角色) → BDP 缓冲 + BBR/fq + 条件 tc 整形
+# 成本在握手，不在稳态带宽:
+#   内层短流 multiplex 到少量 VLESS+Reality 外层承载
+#   不使用 xtls-rprx-vision（Vision 拒绝 TCP Mux）
 #
 # 子脚本:
-#   vless-reality-chain-install.sh  — 链路安装
-#   vless-chain-net-stack.sh        — 网络栈杠杆
+#   vless-short-reality-install.sh  — 链路安装
+#   vless-chain-net-stack.sh        — --profile short
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_SH="${SCRIPT_DIR}/vless-reality-chain-install.sh"
+INSTALL_SH="${SCRIPT_DIR}/vless-short-reality-install.sh"
 NET_SH="${SCRIPT_DIR}/vless-chain-net-stack.sh"
 
 usage() {
   cat <<EOF
 Usage: $(basename "$0") <command> [options]
 
+短连接双跳: Client → Entry(VLESS+Reality+Mux) → Exit(VLESS+Reality+Mux) → Internet
+
 Commands:
-  install-exit    安装 Exit 节点（第一步，在出口 VPS 执行）
-  install-entry   安装 Entry 节点（第二步，在入口 VPS 执行）
-  net-stack       单独应用/刷新网络栈优化
-  status          查看 xray + 凭据 + 网络栈状态
-  client          输出客户端 VLESS 链接与二维码
-  restore-net     回滚网络栈至 apply 前状态
+  install-exit    安装 Exit（第一步，出口 VPS）
+  install-entry   安装 Entry（第二步，入口 VPS）
+  net-stack       单独应用短连接网络栈
+  status          查看 xray + 凭据 + 网络栈
+  client          输出客户端 JSON（含 Mux）与链接
+  restore-net     回滚网络栈
+  self-test       本地校验生成的配置（不改系统）
 
 快速部署:
   # 1. Exit VPS
   sudo bash $(basename "$0") install-exit --entry-ip <Entry公网IP>
 
-  # 2. 复制 /usr/local/etc/xray/chain-credentials.env 到 Entry VPS
+  # 2. 复制 /usr/local/etc/xray/chain-handoff.env 到 Entry VPS
+  #    这个文件没有私钥
 
   # 3. Entry VPS
-  sudo bash $(basename "$0") install-entry --cred-file ./chain-credentials.env
+  sudo bash $(basename "$0") install-entry --cred-file ./chain-handoff.env
 
 说明:
-  - 无需提供带宽/RTT，网络栈全自动探测
+  - 客户端必须打开 Mux。只导入 vless:// 链接不会启用 Mux
+  - 已知出口速率时再加 --uplink-mbit；未实测则不改套接字缓冲、不做整形
   - 跳过网络栈: install-exit/install-entry 加 --no-net-tune
-  - 详细参数: bash $(basename "$0") install-exit --help
-  - 短连接（Mux 承载，不用 Vision）: bash vless-short-chain.sh --help
 
 EOF
 }
 
-die() { echo "[vless-chain] ERROR: $*" >&2; exit 1; }
+die() { echo "[vless-short] ERROR: $*" >&2; exit 1; }
 
 require_scripts() {
-  [[ -x "$INSTALL_SH" || -f "$INSTALL_SH" ]] || die "缺少 ${INSTALL_SH}"
-  [[ -x "$NET_SH" || -f "$NET_SH" ]] || die "缺少 ${NET_SH}"
+  [[ -f "$INSTALL_SH" ]] || die "缺少 ${INSTALL_SH}"
+  [[ -f "$NET_SH" ]] || die "缺少 ${NET_SH}"
 }
 
 main() {
@@ -85,7 +88,7 @@ main() {
         fi
       fi
       [[ -n "$role" ]] || die "请指定 --role entry|exit，或先完成节点安装"
-      bash "$NET_SH" --role "$role" --mode apply "${args[@]}"
+      bash "$NET_SH" --profile short --role "$role" --mode apply "${args[@]}"
       ;;
     status)
       shift
@@ -107,7 +110,11 @@ main() {
           *) die "未知参数: $1" ;;
         esac
       done
-      bash "$NET_SH" --role "$role" --mode restore
+      bash "$NET_SH" --profile short --role "$role" --mode restore
+      ;;
+    self-test)
+      require_scripts
+      bash "$INSTALL_SH" --mode self-test
       ;;
     -h|--help|help)
       usage
