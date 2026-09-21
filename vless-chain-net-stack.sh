@@ -567,7 +567,7 @@ delegate_short_profile() {
   [[ "$PROFILE" == "short" ]] || return 1
   local here target mode args
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  target="${here}/vless-short-reality-install.sh"
+  target="${here}/vless-short-chain.sh"
   [[ -f "$target" ]] || return 1
   mode="optimize"
   [[ "$MODE" == "restore" ]] && mode="restore-net"
